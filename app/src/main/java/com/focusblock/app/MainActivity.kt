@@ -176,10 +176,9 @@ class MainActivity : AppCompatActivity() {
                 startBlocker()
             }
         } else {
-            startService(
-                Intent(this@MainActivity, BlockerVpnService::class.java)
-                    .setAction(BlockerVpnService.ACTION_STOP)
-            )
+            // stopService() is always permitted (even from the background) and
+            // reliably destroys the service -> onDestroy() -> shutdown().
+            stopService(Intent(this@MainActivity, BlockerVpnService::class.java))
             updateStatus(false)
         }
     }

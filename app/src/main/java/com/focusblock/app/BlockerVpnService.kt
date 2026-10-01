@@ -32,6 +32,10 @@ import kotlin.concurrent.thread
  * NXDOMAIN answer ("this site does not exist"), everything else is forwarded
  * to a real resolver through a protected socket. No traffic is inspected,
  * logged, or sent anywhere except DNS questions themselves.
+ *
+ * Stopping is deliberately robust and works from every entry point (in-app
+ * switch, notification action, system): [shutdown] is idempotent, closes the
+ * tunnel synchronously and always removes the foreground state.
  */
 class BlockerVpnService : VpnService() {
 
@@ -51,6 +55,7 @@ class BlockerVpnService : VpnService() {
     companion object {
         const val ACTION_START = "com.focusblock.app.action.START"
         const val ACTION_STOP = "com.focusblock.app.action.STOP"
+        const val ACTION_STOP_NOTIFICATION = "com.focusblock.app.action.STOP_NOTIFICATION"
         const val ACTION_LIST_CHANGED = "com.focusblock.app.action.LIST_CHANGED"
         const val ACTION_STATE = "com.focusblock.app.action.STATE"
         const val EXTRA_RUNNING = "running"
@@ -99,6 +104,11 @@ class BlockerVpnService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> {
                 Log.i(TAG, "stop requested")
+                // Tear down synchronously, then ask the system to destroy us.
+                // Doing the cleanup here (not only in the asynchronous
+                // onDestroy) avoids races with a START intent that may already
+                // be queued behind this one.
+                shutdown()
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -113,7 +123,7 @@ class BlockerVpnService : VpnService() {
             else -> {
                 refreshMatcher()
                 startForegroundWithNotification()
-                if (tun == null) {
+                if (tun == null || readerThread?.isAlive != true) {
                     establishTunnel()
                 } else {
                     updateStatusNotification()
@@ -130,6 +140,7 @@ class BlockerVpnService : VpnService() {
 
     override fun onRevoke() {
         Log.i(TAG, "VPN consent revoked")
+        shutdown()
         stopSelf()
     }
 
@@ -142,6 +153,8 @@ class BlockerVpnService : VpnService() {
 
     private fun establishTunnel() {
         try {
+            // Drop any stale tunnel first (e.g. the reader thread has died).
+            closeTunnelQuietly()
             val builder = Builder()
                 .setSession("FocusBlock")
                 .setMtu(VPN_MTU)
@@ -171,11 +184,31 @@ class BlockerVpnService : VpnService() {
         }
     }
 
+    /**
+     * Fully tears down the tunnel and the foreground state. Idempotent: safe
+     * to call multiple times and from any thread. Unlike a guarded version,
+     * this ALWAYS clears the foreground notification and broadcasts the new
+     * state, so the service can never get stuck "running".
+     */
     private fun shutdown() {
-        if (!running && tun == null) return
         Log.i(TAG, "shutting down")
         running = false
         isRunning = false
+        closeTunnelQuietly()
+        // Snapshot before closing: UdpForwarder.close() fires onClose, which
+        // removes the entry from the map — iterating live would risk a
+        // ConcurrentModificationException in the middle of the teardown.
+        forwarders.values.toList().forEach { it.close() }
+        forwarders.clear()
+        try {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopForeground failed", e)
+        }
+        broadcastState(false)
+    }
+
+    private fun closeTunnelQuietly() {
         try {
             input?.close()
         } catch (_: Exception) {
@@ -187,10 +220,6 @@ class BlockerVpnService : VpnService() {
         tun = null
         input = null
         output = null
-        forwarders.values.forEach { it.close() }
-        forwarders.clear()
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        broadcastState(false)
     }
 
     // -------------------------------------------------------------- packet IO
@@ -337,9 +366,14 @@ class BlockerVpnService : VpnService() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val stop = PendingIntent.getService(
+        // A broadcast (not a service start) is used here: a PendingIntent that
+        // starts a service can be rejected on Android 12+ when the app is in
+        // the background, which used to make the Stop action silently fail.
+        val stop = PendingIntent.getBroadcast(
             this, 1,
-            Intent(this, BlockerVpnService::class.java).setAction(ACTION_STOP),
+            Intent(this, StopReceiver::class.java)
+                .setAction(ACTION_STOP_NOTIFICATION)
+                .setPackage(packageName),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_STATUS)
