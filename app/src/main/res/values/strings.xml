@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FocusBlock</string>
+    <string name="tagline">Free website blocker for focus. No account, no ads, no tracking — everything stays on your device.</string>
+    <string name="enable_blocking">Block websites</string>
+    <string name="status_on">Protection is ON — blocking %1$d site(s).</string>
+    <string name="status_off">Protection is OFF. Turn on the switch to block your list.</string>
+    <string name="domain_hint">e.g. reddit.com or www.youtube.com</string>
+    <string name="add">Add</string>
+    <string name="remove">Remove</string>
+    <string name="blocked_sites_count">Blocked sites (%1$d)</string>
+    <string name="empty_list_hint">No sites blocked yet. Add your first distraction above.</string>
+    <string name="footer_hint">How it works: FocusBlock runs a local VPN that only intercepts DNS lookups for your blocked sites and answers "this site does not exist". No data ever leaves your device and other apps keep working normally. Browsers show a "site can\'t be reached" error for blocked sites. For strict blocking, also turn off "Private DNS" in Android settings and any "Secure DNS" option in your browser.</string>
+</resources>
