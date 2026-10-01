@@ -6,6 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -19,6 +21,7 @@ import com.focusblock.app.net.UdpForwarder
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
@@ -52,7 +55,7 @@ class BlockerVpnService : VpnService() {
     private var input: FileInputStream? = null
     private var output: FileOutputStream? = null
     private var readerThread: Thread? = null
-    private val forwarders = ConcurrentHashMap<Long, UdpForwarder>()
+    private val forwarders = ConcurrentHashMap<String, UdpForwarder>()
     private val writeLock = Any()
 
     @Volatile private var lastBlockedNotifiedMs = 0L
@@ -73,7 +76,19 @@ class BlockerVpnService : VpnService() {
         private const val BLOCKED_NOTIF_INTERVAL_MS = 5_000L
         private const val VPN_MTU = 1500
 
-        /** Dummy DNS server address "inside" the tunnel; queries land in the TUN device. */
+        /**
+         * Address assigned to the TUN interface itself. Must be DIFFERENT from
+         * [VPN_ADDRESS]: packets addressed to one of the device's own interface
+         * addresses are delivered locally by the kernel and never enter the
+         * tunnel, which previously broke every DNS lookup ("no website loads").
+         */
+        const val VPN_INTERFACE_ADDRESS = "10.0.0.1"
+
+        /**
+         * Dummy DNS server address "inside" the tunnel. Advertised to the
+         * system via addDnsServer and routed into the TUN via addRoute, so
+         * queries for it land in the tunnel and can be answered/forged there.
+         */
         const val VPN_ADDRESS = "10.0.0.2"
 
         /** Upstream resolver used for allowed queries sent to the dummy address. */
@@ -163,7 +178,7 @@ class BlockerVpnService : VpnService() {
             val builder = Builder()
                 .setSession("FocusBlock")
                 .setMtu(VPN_MTU)
-                .addAddress(VPN_ADDRESS, 32)
+                .addAddress(VPN_INTERFACE_ADDRESS, 32)
                 .addDnsServer(VPN_ADDRESS)
                 .addRoute(VPN_ADDRESS, 32)
             for (resolver in CAPTURED_RESOLVERS) {
@@ -262,7 +277,7 @@ class BlockerVpnService : VpnService() {
         if (n < Ipv4Udp.IP_HEADER_LEN || buf[0].toInt() ushr 4 != 4) return // IPv4 only
         val udp = Ipv4Udp.parse(buf, n) ?: return                        // non-UDP / fragmented / malformed
         if (udp.dstPort != 53) return                                      // only DNS is routed here anyway
-        val upstreamIp = if (udp.dstIp == VPN_ADDRESS_IP) DEFAULT_UPSTREAM_IP else udp.dstIp
+        val upstreamIp = if (udp.dstIp == VPN_ADDRESS_IP) preferredUpstream() else udp.dstIp
 
         val payload = buf.copyOfRange(udp.payloadOffset, udp.payloadOffset + udp.payloadLength)
         val name = DnsMessages.extractQueryName(payload, payload.size)
@@ -277,11 +292,37 @@ class BlockerVpnService : VpnService() {
         forwardDns(udp, payload, upstreamIp)
     }
 
+    /**
+     * The resolver allowed queries are forwarded to. Uses the DNS servers of
+     * the underlying (non-VPN) network — most compatible with carrier/portal
+     * networks that intercept port 53 — and falls back to 1.1.1.1.
+     */
+    private fun preferredUpstream(): Int {
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return DEFAULT_UPSTREAM_IP
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                val link = cm.getLinkProperties(network) ?: continue
+                for (dns in link.dnsServers) {
+                    if (dns is Inet4Address) {
+                        return Ipv4Udp.ipToInt(dns.hostAddress)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "failed to read underlying DNS, using fallback", e)
+        }
+        return DEFAULT_UPSTREAM_IP
+    }
+
     private fun forwardDns(udp: Ipv4Udp.UdpInfo, payload: ByteArray, upstreamIp: Int) {
-        val key = forwarderKey(udp.srcIp, udp.srcPort, upstreamIp)
+        // The client address AND the queried destination identify a flow:
+        // replies must come from the exact address the client queried.
+        val key = "${udp.srcIp}:${udp.srcPort}:${udp.dstIp}"
         var fwd = forwarders[key]
         if (fwd == null) {
-            val created = createForwarder(udp.srcIp, udp.srcPort, upstreamIp, key) ?: return
+            val created = createForwarder(udp, upstreamIp, key) ?: return
             val existing = forwarders.putIfAbsent(key, created)
             fwd = if (existing != null) {
                 created.close()
@@ -296,7 +337,7 @@ class BlockerVpnService : VpnService() {
             Log.w(TAG, "forward send failed, recreating forwarder", e)
             forwarders.remove(key, fwd)
             fwd.close()
-            val created = createForwarder(udp.srcIp, udp.srcPort, upstreamIp, key) ?: return
+            val created = createForwarder(udp, upstreamIp, key) ?: return
             forwarders[key] = created
             try {
                 created.send(payload)
@@ -306,16 +347,25 @@ class BlockerVpnService : VpnService() {
         }
     }
 
-    private fun createForwarder(clientIp: Int, clientPort: Int, upstreamIp: Int, key: Long): UdpForwarder? {
+    private fun createForwarder(udp: Ipv4Udp.UdpInfo, upstreamIp: Int, key: String): UdpForwarder? {
         return try {
             val socket = DatagramSocket()
-            protect(socket)
+            val protectedOk = protect(socket)
+            if (!protectedOk) {
+                Log.w(TAG, "protect() returned false for forwarder socket")
+            }
             UdpForwarder(
                 socket = socket,
-                clientIp = clientIp,
-                clientPort = clientPort,
+                clientIp = udp.srcIp,
+                clientPort = udp.srcPort,
                 serverIp = upstreamIp,
                 serverPort = 53,
+                // The reply injected into the tunnel must appear to come from
+                // the address the client originally queried (e.g. the dummy
+                // 10.0.0.2), not from the real upstream — otherwise the
+                // client's kernel drops it as an unsolicited packet.
+                replySourceIp = udp.dstIp,
+                replySourcePort = udp.dstPort,
                 onPacket = { packet ->
                     try {
                         writePacket(packet)
@@ -329,15 +379,6 @@ class BlockerVpnService : VpnService() {
             Log.e(TAG, "failed to create forwarder", e)
             null
         }
-    }
-
-    private fun forwarderKey(srcIp: Int, srcPort: Int, dstIp: Int): Long {
-        // 32-bit srcIp | 16-bit srcPort | 8-bit identity of dstIp
-        val dstTag = (dstIp xor (dstIp ushr 8) xor (dstIp ushr 16) xor (dstIp ushr 24)) and 0xff
-        var h = srcIp.toLong() and 0xffffffffL
-        h = h * 31 + srcPort
-        h = h * 31 + dstTag
-        return h
     }
 
     // ---------------------------------------------------------- notifications

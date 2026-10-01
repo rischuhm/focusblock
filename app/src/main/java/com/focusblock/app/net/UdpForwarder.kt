@@ -6,10 +6,20 @@ import java.net.InetAddress
 import kotlin.concurrent.thread
 
 /**
- * Relays DNS payloads between one app-side client (srcIp:srcPort) and one
+ * Relays DNS payloads between one app-side client (clientIp:clientPort) and one
  * upstream resolver through a VPN-protected socket. Replies are re-wrapped
  * into IPv4/UDP packets addressed back to the original client and handed to
  * [onPacket] (which writes them into the TUN device).
+ *
+ * CRITICAL — two different "server" addresses are tracked:
+ *  - [serverIp]/[serverPort] is the REAL resolver the payload is forwarded to
+ *    (e.g. 1.1.1.1 or the underlying network's DNS).
+ *  - [replySourceIp]/[replySourcePort] is the address the CLIENT originally
+ *    sent its query to (typically the tunnel's dummy DNS 10.0.0.2, or a
+ *    hardcoded public resolver). The reply injected back into the TUN MUST
+ *    claim this source: UDP replies from an unexpected source address are
+ *    dropped by the client's kernel, which previously broke resolution for
+ *    every non-blocked domain.
  *
  * The forwarder owns its socket; it self-terminates after [idleTimeoutMs] of
  * inactivity and calls [onClose] so the owner can drop it from its map.
@@ -20,6 +30,8 @@ class UdpForwarder(
     private val clientPort: Int,
     private val serverIp: Int,
     private val serverPort: Int,
+    private val replySourceIp: Int,
+    private val replySourcePort: Int,
     private val onPacket: (ByteArray) -> Unit,
     private val onClose: (UdpForwarder) -> Unit,
     private val idleTimeoutMs: Long = 180_000L,
@@ -47,7 +59,9 @@ class UdpForwarder(
             }
             lastActivityMs = System.currentTimeMillis()
             val payload = packet.data.copyOfRange(packet.offset, packet.offset + packet.length)
-            val out = Ipv4Udp.buildPacket(serverIp, serverPort, clientIp, clientPort, payload)
+            val out = Ipv4Udp.buildPacket(
+                replySourceIp, replySourcePort, clientIp, clientPort, payload
+            )
             try {
                 onPacket(out)
             } catch (e: Exception) {

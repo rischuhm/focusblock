@@ -17,11 +17,16 @@ import kotlin.concurrent.thread
  * Integration test of the DNS forwarding path on the JVM: a UDP echo server
  * plays the upstream resolver, the forwarder relays a query and the reply is
  * re-wrapped into a correct IPv4/UDP packet addressed to the original client.
+ *
+ * Regression test for the "no website loads" bug: the injected reply must
+ * claim the address the client originally QUERIED (the tunnel's dummy DNS
+ * 10.0.0.2), not the real upstream's address — UDP replies from an unexpected
+ * source are dropped by the client's kernel.
  */
 class UdpForwarderTest {
 
     @Test
-    fun forwardsPayloadAndRewrapsReply() {
+    fun forwardsPayloadAndRepliesFromQueriedAddress() {
         // Upstream echo server on 127.0.0.1 with an ephemeral port.
         val server = DatagramSocket(InetSocketAddress("127.0.0.1", 0))
         val serverPort = server.localPort
@@ -39,6 +44,7 @@ class UdpForwarderTest {
         val clientIp = Ipv4Udp.ipToInt("10.0.0.1")
         val clientPort = 40000
         val serverIp = Ipv4Udp.ipToInt("127.0.0.1")
+        val dummyDnsIp = Ipv4Udp.ipToInt("10.0.0.2") // what the client "queried"
 
         val fwd = UdpForwarder(
             socket = DatagramSocket(),
@@ -46,6 +52,8 @@ class UdpForwarderTest {
             clientPort = clientPort,
             serverIp = serverIp,
             serverPort = serverPort,
+            replySourceIp = dummyDnsIp,
+            replySourcePort = 53,
             onPacket = { packet ->
                 received = packet
                 latch.countDown()
@@ -62,9 +70,11 @@ class UdpForwarderTest {
 
         val packet = received!!
         val parsed = Ipv4Udp.parse(packet, packet.size)!!
-        assertEquals(serverIp, parsed.srcIp)
+        // Regression assertions: reply must come from the QUERIED dummy DNS...
+        assertEquals(dummyDnsIp, parsed.srcIp)
+        assertEquals(53, parsed.srcPort)
+        // ...and be addressed to the original client.
         assertEquals(clientIp, parsed.dstIp)
-        assertEquals(serverPort, parsed.srcPort)
         assertEquals(clientPort, parsed.dstPort)
         val payload = packet.copyOfRange(parsed.payloadOffset, parsed.payloadOffset + parsed.payloadLength)
         assertArrayEquals(query, payload)
