@@ -35,7 +35,12 @@ import kotlin.concurrent.thread
  *
  * Stopping is deliberately robust and works from every entry point (in-app
  * switch, notification action, system): [shutdown] is idempotent, closes the
- * tunnel synchronously and always removes the foreground state.
+ * tunnel synchronously and always removes the foreground state. Note that
+ * stopService() alone can never destroy this service while the VPN is up:
+ * the system holds a BIND_AUTO_CREATE connection to every active VpnService,
+ * so the stop request must reach the running instance via ACTION_STOP, close
+ * the TUN fd, and only then does the system release the binding and destroy
+ * the service.
  */
 class BlockerVpnService : VpnService() {
 

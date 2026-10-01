@@ -176,9 +176,19 @@ class MainActivity : AppCompatActivity() {
                 startBlocker()
             }
         } else {
-            // stopService() is always permitted (even from the background) and
-            // reliably destroys the service -> onDestroy() -> shutdown().
-            stopService(Intent(this@MainActivity, BlockerVpnService::class.java))
+            // CRITICAL: stopService() alone can NEVER stop this service. While
+            // a VPN is active, the Android system holds a BIND_AUTO_CREATE
+            // connection to every VpnService, and a bound service is not
+            // destroyed by stopService() — onDestroy() (and therefore our
+            // shutdown()) would never run and the tunnel would stay up
+            // forever. The stop intent is delivered to the running service
+            // instance instead: it closes the TUN fd there, which makes the
+            // system release its binding, after which the service is
+            // destroyed normally.
+            startService(
+                Intent(this@MainActivity, BlockerVpnService::class.java)
+                    .setAction(BlockerVpnService.ACTION_STOP)
+            )
             updateStatus(false)
         }
     }
